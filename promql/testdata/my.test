@@ -1,0 +1,38 @@
+# During kube-state-metrics exporter upgrading, we may scrapes more than one instance 
+load 5m
+  kube_node_status_allocatable_nvidia_gpu_cards{instance="1", node="node1"} 8 
+  kube_node_status_allocatable_nvidia_gpu_cards{instance="2", node="node1"} 8
+  kube_node_status_allocatable_nvidia_gpu_cards{instance="1", node="node2"} 4
+  kube_node_status_allocatable_nvidia_gpu_cards{instance="2", node="node2"} 4
+  kube_node_labels{instance="1", node="node1", gpu_type="A"} 1
+  kube_node_labels{instance="2", node="node1", gpu_type="A"} 1
+  kube_node_labels{instance="1", node="node2", gpu_type="B"} 1
+  kube_node_labels{instance="2", node="node2", gpu_type="B"} 1
+
+# If for same metrics, there are many instances, we will get duplicate results.
+eval instant at 5m kube_node_status_allocatable_nvidia_gpu_cards * on (instance,node) kube_node_labels
+  {instance="1", node="node1"} 8
+  {instance="2", node="node1"} 8
+  {instance="1", node="node2"} 4
+  {instance="2", node="node2"} 4
+
+# Use aggregation operator to remote duplicated ones.
+eval instant at 5m max(kube_node_status_allocatable_nvidia_gpu_cards * on (instance,node) kube_node_labels) by (node)
+  {node="node1"} 8
+  {node="node2"} 4
+
+# Add gpu_type.
+eval instant at 5m max(kube_node_status_allocatable_nvidia_gpu_cards * on (instance,node) group_left(gpu_type) kube_node_labels) by (node,gpu_type)
+  {node="node1", gpu_type="A"} 8
+  {node="node2", gpu_type="B"} 4
+
+# Another way to remove duplicated ones.
+eval instant at 5m max(kube_node_status_allocatable_nvidia_gpu_cards) without (instance) * on (node) group_right max(kube_node_labels) without (instance)
+  {node="node1", gpu_type="A"} 8
+  {node="node2", gpu_type="B"} 4
+
+# test absent
+eval instant at 5m absent(up)
+  {} 1
+
+eval instant at 5m absent(kube_node_labels)
