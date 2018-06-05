@@ -84,8 +84,14 @@ func makeDiscovery(role Role, nsDiscovery NamespaceDiscovery, objects ...runtime
 		gvr := action.GetResource()
 		return true, wf.watchFor(gvr), nil
 	})
+	kubeSharedCache := NewKubernetesSharedCache(log.NewNopLogger())
+	shared, _ := kubeSharedCache.GetOrCreate("test", func() (*kubernetesShared, error) {
+		return newKubernetesShared(clientset), nil
+	})
+	defer kubeSharedCache.Start(nil)
 	return &Discovery{
 		client:             clientset,
+		kubeShared:         shared,
 		logger:             log.NewNopLogger(),
 		role:               role,
 		namespaceDiscovery: &nsDiscovery,

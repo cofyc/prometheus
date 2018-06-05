@@ -82,6 +82,9 @@ type Manager struct {
 	targets map[poolKey]map[string]*targetgroup.Group
 	// The sync channels sends the updates in map[targetSetName] where targetSetName is the job value from the scrape config.
 	syncCh chan map[string][]*targetgroup.Group
+	// Kubernetes shared cache for Kubernetes discovery, optional.
+	kubeSharedCache       kubernetes.KubernetesSharedCache
+	kubeSharedCacheCancel context.CancelFunc
 	// True if updates were received in the last 5 seconds.
 	recentlyUpdated bool
 	// Protects recentlyUpdated.
@@ -108,10 +111,20 @@ func (m *Manager) ApplyConfig(cfg map[string]sd_config.ServiceDiscoveryConfig) e
 	defer m.mtx.Unlock()
 
 	m.cancelDiscoverers()
+	if m.kubeSharedCacheCancel != nil {
+		m.kubeSharedCacheCancel()
+		m.kubeSharedCacheCancel = nil
+		m.kubeSharedCache = nil
+	}
 	for name, scfg := range cfg {
 		for provName, prov := range m.providersFromConfig(scfg) {
 			m.startProvider(m.ctx, poolKey{setName: name, provider: provName}, prov)
 		}
+	}
+	if m.kubeSharedCache != nil {
+		ctx, cancel := context.WithCancel(m.ctx)
+		m.kubeSharedCache.Start(ctx.Done())
+		m.kubeSharedCacheCancel = cancel
 	}
 
 	return nil
@@ -232,13 +245,18 @@ func (m *Manager) providersFromConfig(cfg sd_config.ServiceDiscoveryConfig) map[
 		}
 		app("marathon", i, t)
 	}
-	for i, c := range cfg.KubernetesSDConfigs {
-		k, err := kubernetes.New(log.With(m.logger, "discovery", "k8s"), c)
-		if err != nil {
-			level.Error(m.logger).Log("msg", "Cannot create Kubernetes discovery", "err", err)
-			continue
+	if len(cfg.KubernetesSDConfigs) > 0 {
+		if m.kubeSharedCache == nil {
+			m.kubeSharedCache = kubernetes.NewKubernetesSharedCache(m.logger)
 		}
-		app("kubernetes", i, k)
+		for i, c := range cfg.KubernetesSDConfigs {
+			k, err := kubernetes.New(m.kubeSharedCache, log.With(m.logger, "discovery", "k8s"), c)
+			if err != nil {
+				level.Error(m.logger).Log("msg", "Cannot create Kubernetes discovery", "err", err)
+				continue
+			}
+			app("kubernetes", i, k)
+		}
 	}
 	for i, c := range cfg.ServersetSDConfigs {
 		app("serverset", i, zookeeper.NewServersetDiscovery(c, log.With(m.logger, "discovery", "zookeeper")))

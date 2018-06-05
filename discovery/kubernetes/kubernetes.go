@@ -27,16 +27,11 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	yaml_util "github.com/prometheus/prometheus/util/yaml"
+	yaml "gopkg.in/yaml.v2"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/api"
-	apiv1 "k8s.io/client-go/pkg/api/v1"
-	extensionsv1beta1 "k8s.io/client-go/pkg/apis/extensions/v1beta1"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
 )
 
 const (
@@ -95,6 +90,16 @@ type SDConfig struct {
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
+}
+
+func (c *SDConfig) uniqueKeyForShare() (string, error) {
+	cfg := *c
+	// unset unnecessary fields
+	cfg.Role = ""
+	cfg.NamespaceDiscovery = NamespaceDiscovery{}
+	cfg.XXX = nil
+	byt, err := yaml.Marshal(cfg)
+	return string(byt), err
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -165,6 +170,7 @@ type discoverer interface {
 type Discovery struct {
 	sync.RWMutex
 	client             kubernetes.Interface
+	kubeShared         KubernetesShared
 	role               Role
 	logger             log.Logger
 	namespaceDiscovery *NamespaceDiscovery
@@ -179,11 +185,7 @@ func (d *Discovery) getNamespaces() []string {
 	return namespaces
 }
 
-// New creates a new Kubernetes discovery for the given role.
-func New(l log.Logger, conf *SDConfig) (*Discovery, error) {
-	if l == nil {
-		l = log.NewNopLogger()
-	}
+func clientFromConfig(l log.Logger, conf *SDConfig) (kubernetes.Interface, error) {
 	var (
 		kcfg *rest.Config
 		err  error
@@ -238,14 +240,37 @@ func New(l log.Logger, conf *SDConfig) (*Discovery, error) {
 		}
 	}
 
+	// Enable timeout to prevent hanging in case of network issues.
+	kcfg.Timeout = clientTimeout
+	// Disable throttling to reduce latency in large cluster.
+	kcfg.QPS = float32(-1)
 	kcfg.UserAgent = "prometheus/discovery"
 
-	c, err := kubernetes.NewForConfig(kcfg)
+	return kubernetes.NewForConfig(kcfg)
+}
+
+// New creates a new Kubernetes discovery for the given role.
+func New(kubeSharedCache KubernetesSharedCache, l log.Logger, conf *SDConfig) (*Discovery, error) {
+	if l == nil {
+		l = log.NewNopLogger()
+	}
+	key, err := conf.uniqueKeyForShare()
+	if err != nil {
+		return nil, err
+	}
+	shared, err := kubeSharedCache.GetOrCreate(key, func() (*kubernetesShared, error) {
+		client, err := clientFromConfig(l, conf)
+		if err != nil {
+			return nil, err
+		}
+		return newKubernetesShared(client), nil
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &Discovery{
-		client:             c,
+		client:             shared.Clientset(),
+		kubeShared:         shared,
 		logger:             l,
 		role:               conf.Role,
 		namespaceDiscovery: &conf.NamespaceDiscovery,
@@ -254,6 +279,7 @@ func New(l log.Logger, conf *SDConfig) (*Discovery, error) {
 }
 
 const resyncPeriod = 10 * time.Minute
+const clientTimeout = 10 * time.Minute
 
 // Run implements the discoverer interface.
 func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
@@ -263,117 +289,45 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	switch d.role {
 	case RoleEndpoint:
 		for _, namespace := range namespaces {
-			elw := &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return d.client.CoreV1().Endpoints(namespace).List(options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return d.client.CoreV1().Endpoints(namespace).Watch(options)
-				},
-			}
-			slw := &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return d.client.CoreV1().Services(namespace).List(options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return d.client.CoreV1().Services(namespace).Watch(options)
-				},
-			}
-			plw := &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return d.client.CoreV1().Pods(namespace).List(options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return d.client.CoreV1().Pods(namespace).Watch(options)
-				},
-			}
-			nlw := &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return d.client.CoreV1().Nodes().List(options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return d.client.CoreV1().Nodes().Watch(options)
-				},
-			}
 			eps := NewEndpoints(
 				log.With(d.logger, "role", "endpoint"),
-				cache.NewSharedInformer(slw, &apiv1.Service{}, resyncPeriod),
-				cache.NewSharedInformer(elw, &apiv1.Endpoints{}, resyncPeriod),
-				cache.NewSharedInformer(plw, &apiv1.Pod{}, resyncPeriod),
-				cache.NewSharedInformer(nlw, &apiv1.Node{}, resyncPeriod),
+				d.kubeShared.MustGetSharedInformer("services", namespace),
+				d.kubeShared.MustGetSharedInformer("endpoints", namespace),
+				d.kubeShared.MustGetSharedInformer("pods", namespace),
+				d.kubeShared.MustGetSharedInformer("nodes", api.NamespaceAll),
 			)
 			d.discoverers = append(d.discoverers, eps)
-			go eps.endpointsInf.Run(ctx.Done())
-			go eps.serviceInf.Run(ctx.Done())
-			go eps.podInf.Run(ctx.Done())
-			go eps.nodeInf.Run(ctx.Done())
 		}
 	case RolePod:
 		for _, namespace := range namespaces {
-			plw := &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return d.client.CoreV1().Pods(namespace).List(options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return d.client.CoreV1().Pods(namespace).Watch(options)
-				},
-			}
 			pod := NewPod(
 				log.With(d.logger, "role", "pod"),
-				cache.NewSharedInformer(plw, &apiv1.Pod{}, resyncPeriod),
+				d.kubeShared.MustGetSharedInformer("pods", namespace),
 			)
 			d.discoverers = append(d.discoverers, pod)
-			go pod.informer.Run(ctx.Done())
 		}
 	case RoleService:
 		for _, namespace := range namespaces {
-			slw := &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return d.client.CoreV1().Services(namespace).List(options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return d.client.CoreV1().Services(namespace).Watch(options)
-				},
-			}
 			svc := NewService(
 				log.With(d.logger, "role", "service"),
-				cache.NewSharedInformer(slw, &apiv1.Service{}, resyncPeriod),
+				d.kubeShared.MustGetSharedInformer("services", namespace),
 			)
 			d.discoverers = append(d.discoverers, svc)
-			go svc.informer.Run(ctx.Done())
 		}
 	case RoleIngress:
 		for _, namespace := range namespaces {
-			ilw := &cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					return d.client.ExtensionsV1beta1().Ingresses(namespace).List(options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return d.client.ExtensionsV1beta1().Ingresses(namespace).Watch(options)
-				},
-			}
 			ingress := NewIngress(
 				log.With(d.logger, "role", "ingress"),
-				cache.NewSharedInformer(ilw, &extensionsv1beta1.Ingress{}, resyncPeriod),
+				d.kubeShared.MustGetSharedInformer("ingresses", namespace),
 			)
 			d.discoverers = append(d.discoverers, ingress)
-			go ingress.informer.Run(ctx.Done())
 		}
 	case RoleNode:
-		nlw := &cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				return d.client.CoreV1().Nodes().List(options)
-			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				return d.client.CoreV1().Nodes().Watch(options)
-			},
-		}
 		node := NewNode(
 			log.With(d.logger, "role", "node"),
-			cache.NewSharedInformer(nlw, &apiv1.Node{}, resyncPeriod),
+			d.kubeShared.MustGetSharedInformer("nodes", api.NamespaceAll),
 		)
 		d.discoverers = append(d.discoverers, node)
-		go node.informer.Run(ctx.Done())
 	default:
 		level.Error(d.logger).Log("msg", "unknown Kubernetes discovery kind", "role", d.role)
 	}
